@@ -8,6 +8,7 @@ Students need to implement the TODO sections in their own files.
 """
 
 import torch
+import numpy as np
 from src.base_model import BaseScheduler, BaseGenerativeModel
 from src.network import UNet
 
@@ -20,18 +21,19 @@ class CustomScheduler(BaseScheduler):
     """
     Custom Scheduler Skeleton
     
-    TODO: Students need to implement this class in their own file.
-    Required methods:
-    1. sample_timesteps: Sample random timesteps for training
-    2. forward_process: Apply forward process to transform data
-    3. reverse_process_step: Perform one step of the reverse process
-    4. get_target: Get target for model prediction
+    This is a simple linear scheduler, similar to the original DDPM.
     """
     
-    def __init__(self, num_train_timesteps: int = 1000, **kwargs):
+    def __init__(self, num_train_timesteps: int = 1000, beta_start: float = 0.0001, beta_end: float = 0.02, **kwargs):
         super().__init__(num_train_timesteps, **kwargs)
-        # TODO: Initialize your scheduler-specific parameters (e.g., betas, alphas, sigma_min)
-    
+        betas = torch.linspace(beta_start, beta_end, num_train_timesteps)
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+
     def sample_timesteps(self, batch_size: int, device: torch.device):
         """
         Sample random timesteps for training.
@@ -39,7 +41,7 @@ class CustomScheduler(BaseScheduler):
         Returns:
             Tensor of shape (batch_size,) with timestep values
         """
-        raise NotImplementedError("Students need to implement this method")
+        return torch.randint(0, self.num_train_timesteps, (batch_size,), device=device)
     
     def forward_process(self, data, noise, t):
         """
@@ -53,7 +55,14 @@ class CustomScheduler(BaseScheduler):
         Returns:
             Noisy data at timestep t
         """
-        raise NotImplementedError("Students need to implement this method")
+        sqrt_alphas_cumprod = self.alphas_cumprod[t].sqrt()
+        sqrt_one_minus_alphas_cumprod = (1. - self.alphas_cumprod[t]).sqrt()
+        
+        # Reshape to (batch_size, 1, 1, 1) for broadcasting
+        sqrt_alphas_cumprod = sqrt_alphas_cumprod.view(-1, 1, 1, 1)
+        sqrt_one_minus_alphas_cumprod = sqrt_one_minus_alphas_cumprod.view(-1, 1, 1, 1)
+        
+        return sqrt_alphas_cumprod * data + sqrt_one_minus_alphas_cumprod * noise
     
     def reverse_process_step(self, xt, pred, t, t_next):
         """
@@ -61,41 +70,56 @@ class CustomScheduler(BaseScheduler):
         
         Args:
             xt: Current noisy data
-            pred: Model prediction (e.g., predicted noise, velocity, or x0)
+            pred: Model prediction (predicted noise)
             t: Current timestep
             t_next: Next timestep
             
         Returns:
             Updated data at timestep t_next
         """
-        raise NotImplementedError("Students need to implement this method")
-    
+        alpha_t = self.alphas[t]
+        alpha_cumprod_t = self.alphas_cumprod[t]
+        beta_t = self.betas[t]
+
+        # Reshape for broadcasting
+        alpha_t = alpha_t.view(-1, 1, 1, 1)
+        alpha_cumprod_t = alpha_cumprod_t.view(-1, 1, 1, 1)
+        beta_t = beta_t.view(-1, 1, 1, 1)
+
+        # Simple DDPM reverse step
+        pred_x0 = (xt - torch.sqrt(1. - alpha_cumprod_t) * pred) / torch.sqrt(alpha_cumprod_t)
+        
+        if t_next[0] < 0:
+            return pred_x0
+
+        alpha_cumprod_t_next = self.alphas_cumprod[t_next].view(-1, 1, 1, 1)
+        
+        mu = (torch.sqrt(alpha_cumprod_t_next) * beta_t * pred_x0 + torch.sqrt(alpha_t) * (1. - alpha_cumprod_t_next) * xt) / (1. - alpha_cumprod_t)
+        
+        if t[0] > 0:
+            variance = (1. - alpha_cumprod_t_next) / (1. - alpha_cumprod_t) * beta_t
+            noise = torch.randn_like(xt)
+            return mu + torch.sqrt(variance) * noise
+        else:
+            return mu
+
     def get_target(self, data, noise, t):
         """
         Get the target for model prediction (what the network should learn to predict).
-        
-        Args:
-            data: Clean data
-            noise: Noise
-            t: Timestep
-            
-        Returns:
-            Target tensor (e.g., noise for DDPM, velocity for Flow Matching)
+        For DDPM, the target is the noise.
         """
-        raise NotImplementedError("Students need to implement this method")
+        return noise
 
 
 class CustomGenerativeModel(BaseGenerativeModel):
     """
     Custom Generative Model Skeleton
     
-    Students need to implement this class by inheriting from BaseGenerativeModel.
-    This class wraps the network and scheduler to provide training and sampling interfaces.
+    This is a simple DDPM-style generative model.
     """
     
     def __init__(self, network, scheduler, **kwargs):
         super().__init__(network, scheduler, **kwargs)
-        # TODO: Initialize your model-specific parameters (e.g., EMA, loss weights)
     
     def compute_loss(self, data, noise, **kwargs):
         """
@@ -103,13 +127,18 @@ class CustomGenerativeModel(BaseGenerativeModel):
         
         Args:
             data: Clean data batch
-            noise: Noise batch (or x0 for flow models)
+            noise: Noise batch
             **kwargs: Additional arguments
             
         Returns:
             Loss tensor
         """
-        raise NotImplementedError("Students need to implement this method")
+        t = self.scheduler.sample_timesteps(data.shape[0], device=data.device)
+        xt = self.scheduler.forward_process(data, noise, t)
+        pred = self.predict(xt, t)
+        target = self.scheduler.get_target(data, noise, t)
+        loss = torch.nn.functional.mse_loss(pred, target)
+        return loss
     
     def predict(self, xt, t, **kwargs):
         """
@@ -118,12 +147,12 @@ class CustomGenerativeModel(BaseGenerativeModel):
         Args:
             xt: Noisy data
             t: Timestep
-            **kwargs: Additional arguments (e.g., condition for additional timestep)
+            **kwargs: Additional arguments
             
         Returns:
-            Model prediction
+            Model prediction (predicted noise)
         """
-        raise NotImplementedError("Students need to implement this method")
+        return self.network(xt, t)
     
     def sample(self, shape, num_inference_timesteps=20, return_traj=False, verbose=False, **kwargs):
         """
@@ -139,7 +168,22 @@ class CustomGenerativeModel(BaseGenerativeModel):
         Returns:
             Generated samples (or trajectory if return_traj=True)
         """
-        raise NotImplementedError("Students need to implement this method")
+        xt = torch.randn(shape, device=self.device)
+        traj = [xt]
+        
+        timesteps = torch.linspace(self.scheduler.num_train_timesteps - 1, 0, num_inference_timesteps, dtype=torch.long, device=self.device)
+
+        for i in range(num_inference_timesteps):
+            t = timesteps[i].expand(shape[0])
+            t_next = timesteps[i+1] if i < num_inference_timesteps - 1 else torch.tensor([-1], device=self.device)
+            t_next = t_next.expand(shape[0])
+
+            pred = self.predict(xt, t)
+            xt = self.scheduler.reverse_process_step(xt, pred, t, t_next)
+            if return_traj:
+                traj.append(xt)
+
+        return traj if return_traj else xt
 
 
 # ============================================================================
@@ -174,7 +218,7 @@ def create_custom_model(device="cpu", **kwargs):
     num_train_timesteps = kwargs.get('num_train_timesteps', 1000)
     
     # Create your scheduler
-    scheduler = CustomScheduler(num_train_timesteps=num_train_timesteps, **kwargs)
+    scheduler = CustomScheduler(num_train_timesteps=num_train_timesteps, **{k: v for k, v in kwargs.items() if k != 'num_train_timesteps'})
     
     # Create your model
     model = CustomGenerativeModel(network, scheduler, **kwargs)
